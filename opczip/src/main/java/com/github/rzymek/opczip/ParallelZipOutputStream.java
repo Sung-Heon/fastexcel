@@ -33,7 +33,7 @@ public class ParallelZipOutputStream extends OutputStream {
         // CheckedOutputStream: 지나가는 데이터의 CRC32 값을 계산합니다.
         // DeflaterOutputStream: 데이터를 DEFLATE 알고리즘으로 압축합니다.
         this.chainedStream = new OpcOutputStream(
-                new CheckedOutputStream(new FileOutputStream(tempFilePath.toFile()), crc)
+                new CheckedOutputStream(Files.newOutputStream(tempFilePath.toFile().toPath()), crc)
         );
     }
 
