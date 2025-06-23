@@ -8,7 +8,6 @@ import java.nio.file.Path;
 import java.util.Objects;
 import java.util.zip.CRC32;
 import java.util.zip.CheckedOutputStream;
-import java.util.zip.DeflaterOutputStream;
 
 public class ParallelZipOutputStream extends OutputStream {
 
