@@ -16,6 +16,8 @@
 package org.dhatim.fastexcel;
 
 import com.github.rzymek.opczip.OpcOutputStream;
+import com.github.rzymek.opczip.ParallelZipEntry;
+import com.github.rzymek.opczip.ParallelZipOutputStream;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -27,9 +29,11 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * A {@link Workbook} contains one or more {@link Worksheet} objects.
@@ -49,7 +53,10 @@ public class Workbook implements Closeable {
     private final AtomicInteger maxTableIndex = new AtomicInteger(1);
     private final boolean parallelMode;
     private final ExecutorService executorService;
+    private final ZipOutputStream zipOutputStream;
 
+    // [추가] 병렬 처리 시, 각 작업의 결과(임시 파일 정보)를 저장할 리스트
+    private final List<ParallelZipEntry> parallelResults = new ArrayList<>();
     /**
      * Constructor.
      *
@@ -67,6 +74,7 @@ public class Workbook implements Closeable {
 
     public Workbook(OutputStream os, String applicationName, String applicationVersion, ExecutorService executorService) {
         this.os = new OpcOutputStream(os);
+        this.zipOutputStream = new ZipOutputStream(os);
         /* Tests showed that:
          * The default (-1) is level 6
          * Level 4 gives best size and very good time
@@ -387,18 +395,31 @@ public class Workbook implements Closeable {
         w.append("\"/>");
     }
 
-    /**
-     * Write a new file as a zip entry to the output writer.
-     *
-     * @param name     File name.
-     * @param consumer Output writer consumer, producing file contents.
-     * @throws IOException If an I/O error occurs.
-     */
-    void writeFile(String name, ThrowingConsumer<Writer> consumer) throws IOException {
-        synchronized (os) {
-            beginFile(name);
-            consumer.accept(writer);
-            endFile();
+    public void writeFile(String entryName, Consumer<OutputStream> contentWriter) throws IOException {
+        if (parallelMode) {
+            // --- 신규 로직 (병렬 모드) ---
+            // 1. TempFileCompressingOutputStream을 생성하여 임시 파일에 압축을 시작합니다.
+            //    try-with-resources를 사용하여 스트림이 자동으로 닫히도록 합니다.
+            ParallelZipOutputStream tempStream = new ParallelZipOutputStream(entryName);
+            try (tempStream) {
+                // 2. 사용자가 제공한 쓰기 로직을 실행하여 내용을 임시 파일에 씁니다.
+                contentWriter.accept(tempStream);
+            }
+
+            // 3. 스트림이 닫힌 후, 결과(임시 파일 경로, crc 등)를 가져와 리스트에 추가합니다.
+            parallelResults.add(tempStream.getResult());
+
+        } else {
+            // --- 기존 로직 (순차 모드) ---
+            synchronized (this.zipOutputStream) {
+                ZipEntry entry = new ZipEntry(entryName);
+                zipOutputStream.putNextEntry(entry);
+
+                // 기존처럼 바로 최종 ZipOutputStream에 씁니다.
+                contentWriter.accept(zipOutputStream);
+
+                zipOutputStream.closeEntry();
+            }
         }
     }
 
