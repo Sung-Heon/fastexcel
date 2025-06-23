@@ -25,11 +25,11 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
-
 
 /**
  * A {@link Workbook} contains one or more {@link Worksheet} objects.
@@ -47,6 +47,8 @@ public class Workbook implements Closeable {
     private final OpcOutputStream os;
     private final Writer writer;
     private final AtomicInteger maxTableIndex = new AtomicInteger(1);
+    private final boolean parallelMode;
+    private final ExecutorService executorService;
 
     /**
      * Constructor.
@@ -60,6 +62,10 @@ public class Workbook implements Closeable {
      *                           page</a> for details.
      */
     public Workbook(OutputStream os, String applicationName, String applicationVersion) {
+        this(os, applicationName, applicationVersion, null);
+    }
+
+    public Workbook(OutputStream os, String applicationName, String applicationVersion, ExecutorService executorService) {
         this.os = new OpcOutputStream(os);
         /* Tests showed that:
          * The default (-1) is level 6
@@ -76,6 +82,8 @@ public class Workbook implements Closeable {
             throw new IllegalArgumentException("Application version must be of the form XX.YYYY");
         }
         this.applicationVersion = applicationVersion;
+        this.executorService = executorService;
+        this.parallelMode = this.executorService != null;
     }
 
     /**
