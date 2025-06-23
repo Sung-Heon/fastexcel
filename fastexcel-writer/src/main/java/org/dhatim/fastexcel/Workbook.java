@@ -22,7 +22,9 @@ import com.github.rzymek.opczip.ParallelZipOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -395,28 +397,41 @@ public class Workbook implements Closeable {
         w.append("\"/>");
     }
 
-    public void writeFile(String entryName, Consumer<OutputStream> contentWriter) throws IOException {
+    public void writeFile(String entryName, IOConsumer<Writer> contentWriter) throws IOException {
         if (parallelMode) {
-            // --- 신규 로직 (병렬 모드) ---
-            // 1. TempFileCompressingOutputStream을 생성하여 임시 파일에 압축을 시작합니다.
-            //    try-with-resources를 사용하여 스트림이 자동으로 닫히도록 합니다.
+            // --- 신규 병렬 로직 ---
             ParallelZipOutputStream tempStream = new ParallelZipOutputStream(entryName);
-            try (tempStream) {
-                // 2. 사용자가 제공한 쓰기 로직을 실행하여 내용을 임시 파일에 씁니다.
-                contentWriter.accept(tempStream);
-            }
+            try (tempStream) { // try-with-resources로 tempStream 자동 닫기 보장
 
-            // 3. 스트림이 닫힌 후, 결과(임시 파일 경로, crc 등)를 가져와 리스트에 추가합니다.
+                // 1. fastexcel의 Writer를 우리가 만든 임시 파일 스트림을 감싸서 생성합니다.
+                Writer writer = new Writer(tempStream);
+
+                // 2. 사용자의 쓰기 로직을 실행합니다. (w.append(...) 등)
+                contentWriter.accept(writer);
+
+                // 3. [매우 중요] 쓰기 로직이 끝난 후, Writer의 내부 버퍼에 남아있는 내용을
+                //    모두 tempStream으로 밀어넣도록 flush()를 호출합니다.
+                writer.flush();
+
+            } // 이 블록을 벗어나면 tempStream.close()가 호출됨
+
+            // 4. 결과(임시 파일 정보)를 리스트에 추가합니다.
             parallelResults.add(tempStream.getResult());
 
         } else {
-            // --- 기존 로직 (순차 모드) ---
+            // --- 기존 순차 로직 ---
             synchronized (this.zipOutputStream) {
                 ZipEntry entry = new ZipEntry(entryName);
                 zipOutputStream.putNextEntry(entry);
 
-                // 기존처럼 바로 최종 ZipOutputStream에 씁니다.
-                contentWriter.accept(zipOutputStream);
+                // 1. fastexcel의 Writer를 기존 zipOutputStream을 감싸서 생성합니다.
+                Writer writer = new Writer(zipOutputStream);
+
+                // 2. 사용자의 쓰기 로직을 실행합니다.
+                contentWriter.accept(writer);
+
+                // 3. [매우 중요] 다음 엔트리로 넘어가기 전, 버퍼를 비워줍니다.
+                writer.flush();
 
                 zipOutputStream.closeEntry();
             }
