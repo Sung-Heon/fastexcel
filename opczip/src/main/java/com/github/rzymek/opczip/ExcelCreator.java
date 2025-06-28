@@ -1,4 +1,4 @@
-import com.github.rzymek.opczip.OpcZipOutputStream;
+package com.github.rzymek.opczip;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
