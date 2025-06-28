@@ -1,6 +1,5 @@
 import com.github.rzymek.opczip.OpcZipOutputStream;
 
-import java.io.ByteArrayInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -9,7 +8,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.zip.ZipEntry;
 
-public class ParallelExcelCreator {
+public class ExcelCreator {
 
     public static void main(String[] args) throws IOException {
         List<List<Object>> sheet1Data = new ArrayList<>();
