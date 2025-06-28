@@ -132,8 +132,65 @@ public class ParallelExcelCreator {
 
             // 엔트리 닫기 및 ZIP 완성
             ops.closeEntry();
-            ops.finish();
+//            ops.finish();
         }
+    }
+    /**
+     * 압축된 시트 파일에서 XML 내용만 추출합니다.
+     */
+    private static byte[] extractSheetContent(File compressedSheetFile) throws IOException {
+        byte[] fileData = Files.readAllBytes(compressedSheetFile.toPath());
+
+        // ZIP 시작 시그니처 찾기 (로컬 파일 헤더 - PK\x03\x04)
+        int startPos = findSignature(fileData, new byte[]{0x50, 0x4B, 0x03, 0x04});
+
+        if (startPos < 0) {
+            throw new IOException("ZIP 로컬 파일 헤더를 찾을 수 없습니다.");
+        }
+
+        // 파일 이름 길이 위치 (30 바이트 뒤)
+        int fileNameLengthPos = startPos + 26;
+        int fileNameLength = ((fileData[fileNameLengthPos] & 0xff) | ((fileData[fileNameLengthPos + 1] & 0xff) << 8));
+
+        // 추가 필드 길이 위치
+        int extraFieldLengthPos = fileNameLengthPos + 2;
+        int extraFieldLength = ((fileData[extraFieldLengthPos] & 0xff) | ((fileData[extraFieldLengthPos + 1] & 0xff) << 8));
+
+        // 압축된 데이터 시작 위치
+        int dataStartPos = extraFieldLengthPos + 2 + fileNameLength + extraFieldLength;
+
+        // 압축된 데이터 크기 위치 (18 바이트 뒤)
+        int compressedSizePos = startPos + 18;
+        int compressedSize =
+                (fileData[compressedSizePos] & 0xff) |
+                        ((fileData[compressedSizePos + 1] & 0xff) << 8) |
+                        ((fileData[compressedSizePos + 2] & 0xff) << 16) |
+                        ((fileData[compressedSizePos + 3] & 0xff) << 24);
+
+        // 압축된 데이터만 추출
+        byte[] compressedData = new byte[compressedSize];
+        System.arraycopy(fileData, dataStartPos, compressedData, 0, compressedSize);
+
+        return compressedData;
+    }
+
+    /**
+     * 바이트 배열에서 시그니처를 찾습니다.
+     */
+    private static int findSignature(byte[] data, byte[] signature) {
+        for (int i = 0; i <= data.length - signature.length; i++) {
+            boolean found = true;
+            for (int j = 0; j < signature.length; j++) {
+                if (data[i + j] != signature[j]) {
+                    found = false;
+                    break;
+                }
+            }
+            if (found) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -160,15 +217,6 @@ public class ParallelExcelCreator {
                 zos.closeEntry();
             }
         }
-    }
-
-    /**
-     * 압축된 시트 파일에서 XML 내용만 추출합니다.
-     */
-    private static byte[] extractSheetContent(File compressedSheetFile) throws IOException {
-        // 실제 구현에서는 ZIP 파일을 열고 sheet.xml 엔트리를 읽어야 합니다.
-        // 간단한 예제를 위해 여기서는 파일 전체를 읽어옵니다.
-        return Files.readAllBytes(compressedSheetFile.toPath());
     }
 
     /**
