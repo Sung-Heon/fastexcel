@@ -29,21 +29,87 @@ public class ExcelCreator {
         sheet3Data.add(Arrays.asList("2025-02-01", 6000000, 3000000, 3000000));
         sheet3Data.add(Arrays.asList("2025-03-01", 4500000, 2500000, 2000000));
 
-        try (FileOutputStream fos = new FileOutputStream("ThreeSheets.xlsx");
+        // 1. 각 시트 XML을 개별적으로 압축
+        compressIndividualSheets(sheet1Data, sheet2Data, sheet3Data);
+        
+        // 2. 전체를 합쳐서 Excel 파일 생성
+        createCompleteExcel(sheet1Data, sheet2Data, sheet3Data);
+        
+        System.out.println("개별 시트 압축 및 전체 Excel 파일 생성 완료!");
+    }
+    
+    /**
+     * 각 시트 XML을 개별적으로 압축한 파일들을 생성합니다.
+     */
+    private static void compressIndividualSheets(List<List<Object>> sheet1Data, 
+                                                 List<List<Object>> sheet2Data,
+                                                 List<List<Object>> sheet3Data) throws IOException {
+        // 시트1 압축
+        compressSheet("sheet1-compressed.zip", "Sheet1", sheet1Data);
+        
+        // 시트2 압축
+        compressSheet("sheet2-compressed.zip", "Sheet2", sheet2Data);
+        
+        // 시트3 압축
+        compressSheet("sheet3-compressed.zip", "Sheet3", sheet3Data);
+    }
+    
+    /**
+     * 단일 시트 XML을 압축한 파일을 생성합니다.
+     */
+    private static void compressSheet(String outputFileName, String sheetName, List<List<Object>> sheetData) throws IOException {
+        FileOutputStream fos = new FileOutputStream(outputFileName);
+        OpcOutputStream ops = new OpcOutputStream(fos);
+        
+        try {
+            // 압축 레벨 설정
+            ops.setLevel(9); // 최대 압축
+            
+            // ZIP 엔트리 추가
+            ZipEntry entry = new ZipEntry("sheet.xml");
+            ops.putNextEntry(entry);
+            
+            // 시트 XML 데이터 작성
+            String sheetXml = createSheet(sheetName, sheetData);
+            byte[] data = sheetXml.getBytes(StandardCharsets.UTF_8);
+            ops.write(data, 0, data.length);
+            
+            // 엔트리만 닫기 (finish 호출하지 않음)
+            ops.closeEntry();
+            
+            // 스트림을 명시적으로 닫지 않고 flush만 수행
+            // finish()를 호출하지 않음으로써 ZIP 파일은 완전하지 않은 상태로 남게 됨
+            fos.flush();
+            
+            System.out.println(sheetName + " XML이 압축된 파일 생성: " + outputFileName);
+        } finally {
+            // 리소스 누수 방지를 위해 스트림은 닫아줍니다.
+            // 참고: ops.close()는 내부적으로 finish()를 호출하므로 여기서는 호출하지 않습니다.
+            fos.close();
+        }
+    }
+    
+    /**
+     * 전체 시트를 합쳐서 완전한 Excel 파일을 생성합니다.
+     */
+    private static void createCompleteExcel(List<List<Object>> sheet1Data,
+                                            List<List<Object>> sheet2Data,
+                                            List<List<Object>> sheet3Data) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream("ThreeSheets-complete.xlsx");
              OpcZipOutputStream zos = new OpcZipOutputStream(fos)) {
-
+            
             // 시트 추가 (데이터 포함)
             addSheets(zos, sheet1Data, sheet2Data, sheet3Data);
-
+            
             addContentsType(zos);
-
+            
             addRels(zos);
-
+            
             addWorkbook(zos);
-
+            
             addWorkbookrels(zos);
-
-            System.out.println("Excel file with 3 sheets created successfully: ThreeSheets.xlsx");
+            
+            System.out.println("완전한 Excel 파일이 생성되었습니다: ThreeSheets-complete.xlsx");
         }
     }
 
