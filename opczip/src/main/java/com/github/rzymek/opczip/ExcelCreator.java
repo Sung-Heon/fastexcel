@@ -63,7 +63,8 @@ public class ExcelCreator {
         
         try {
             // 압축 레벨 설정
-            ops.setLevel(9); // 최대 압축
+
+            ops.setLevel(4); // 최대 압축
             
             // ZIP 엔트리 추가
             ZipEntry entry = new ZipEntry("sheet.xml");
@@ -76,10 +77,8 @@ public class ExcelCreator {
             
             // 엔트리만 닫기 (finish 호출하지 않음)
             ops.closeEntry();
-            
-            // 스트림을 명시적으로 닫지 않고 flush만 수행
-            // finish()를 호출하지 않음으로써 ZIP 파일은 완전하지 않은 상태로 남게 됨
-            fos.flush();
+            ops.finish();
+
             
             System.out.println(sheetName + " XML이 압축된 파일 생성: " + outputFileName);
         } finally {

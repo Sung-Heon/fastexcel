@@ -2,9 +2,13 @@ package com.github.rzymek.opczip;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.Enumeration;
 import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /**
  * ZIP 파일들의 바이트코드를 비교하여 압축된 내용물의 일치도를 분석합니다.
@@ -21,45 +25,62 @@ public class ZipByteComparer {
             );
             
             // 비교 대상 파일
-            String referenceFile = "simple-compressed-unfinished.zip";
+            String referenceFile = "ThreeSheets-complete.xlsx";
             
             // 파일 존재 여부 확인
             File refFile = new File(referenceFile);
             if (!refFile.exists()) {
                 System.out.println(referenceFile + " 파일이 존재하지 않습니다.");
-                System.out.println("SingleFileExample을 먼저 실행해야 합니다.");
-                
-                // SingleFileExample이 생성한 다른 이름의 파일이 있는지 확인
-                File dir = new File(".");
-                File[] files = dir.listFiles((d, name) -> name.endsWith(".zip"));
-                if (files != null && files.length > 0) {
-                    System.out.println("\n발견된 ZIP 파일들:");
-                    for (File f : files) {
-                        System.out.println(" - " + f.getName());
-                    }
-                    
-                    if (files.length > 0) {
-                        // 첫 번째 발견된 ZIP 파일을 참조 파일로 사용
-                        referenceFile = files[0].getName();
-                        System.out.println("\n대신 " + referenceFile + "을(를) 참조 파일로 사용합니다.");
-                    }
-                } else {
-                    System.out.println("ZIP 파일을 찾을 수 없습니다. 먼저 ExcelCreator와 SingleFileExample을 실행해야 합니다.");
-                    return;
-                }
+                System.out.println("ExcelCreator를 먼저 실행해야 합니다.");
+                return;
             }
             
             System.out.println("ZIP 파일의 압축된 내용물 비교 분석을 시작합니다.\n");
             
-            // 각 시트 파일과 참조 파일의 압축된 내용물 비교
-            for (String sheetFile : sheetFiles) {
+            // ThreeSheets-complete.xlsx 파일에서 시트 XML 추출
+            byte[][] excelSheetBytes = new byte[3][];
+            try {
+                excelSheetBytes = extractSheetsFromExcel(referenceFile);
+                System.out.println("Excel 파일에서 " + countNonNull(excelSheetBytes) + "개의 시트를 추출했습니다.\n");
+            } catch (Exception e) {
+                System.out.println("Excel 파일에서 시트 추출 중 오류 발생: " + e.getMessage());
+                e.printStackTrace();
+            }
+            
+            // 각 시트 파일과 Excel 파일의 시트 부분 비교
+            for (int i = 0; i < sheetFiles.size(); i++) {
+                String sheetFile = sheetFiles.get(i);
                 File sf = new File(sheetFile);
                 if (!sf.exists()) {
                     System.out.println(sheetFile + " 파일이 존재하지 않습니다.");
                     continue;
                 }
                 
-                compareCompressedContent(sheetFile, referenceFile);
+                System.out.println("\n==========================================");
+                System.out.println("파일 1: " + sheetFile + " (크기: " + formatFileSize(sf.length()) + ")");
+                System.out.println("파일 2: " + referenceFile + " (크기: " + formatFileSize(refFile.length()) + ")");
+                
+                // 개별 압축 파일에서 시트 데이터 추출
+                byte[] sheetCompressedData = extractCompressedDataFromPartialZip(sheetFile);
+                
+                if (sheetCompressedData != null) {
+                    System.out.println("\n시트 파일에서 압축된 데이터 추출: " + formatFileSize(sheetCompressedData.length));
+                    
+                    // Excel 파일의 해당 시트와 비교 (인덱스가 일치한다고 가정)
+                    if (i < excelSheetBytes.length && excelSheetBytes[i] != null) {
+                        byte[] excelSheetData = excelSheetBytes[i];
+                        System.out.println("Excel 파일의 시트 " + (i+1) + " 데이터 크기: " + formatFileSize(excelSheetData.length));
+                        
+                        // 두 압축 데이터 비교
+                        compareCompressedData(sheetCompressedData, excelSheetData);
+                    } else {
+                        System.out.println("Excel 파일에서 시트 " + (i+1) + "를 찾을 수 없습니다.");
+                    }
+                } else {
+                    System.out.println("\n시트 파일에서 압축된 데이터를 추출할 수 없습니다.");
+                }
+                
+                System.out.println("==========================================");
             }
             
         } catch (IOException e) {
@@ -69,244 +90,212 @@ public class ZipByteComparer {
     }
     
     /**
-     * 두 ZIP 파일의 압축된 내용물을 비교합니다.
+     * 비완성 ZIP 파일(헤더만 있고 중앙 디렉터리 없는)에서 압축된 데이터를 추출합니다.
      */
-    private static void compareCompressedContent(String file1, String file2) throws IOException {
-        File f1 = new File(file1);
-        File f2 = new File(file2);
+    private static byte[] extractCompressedDataFromPartialZip(String zipFile) throws IOException {
+        File file = new File(zipFile);
+        byte[] allBytes = Files.readAllBytes(file.toPath());
         
-        byte[] bytes1 = Files.readAllBytes(f1.toPath());
-        byte[] bytes2 = Files.readAllBytes(f2.toPath());
-        
-        // 파일 정보 출력
-        System.out.println("\n==========================================");
-        System.out.println("파일 1: " + file1 + " (크기: " + formatFileSize(bytes1.length) + ")");
-        System.out.println("파일 2: " + file2 + " (크기: " + formatFileSize(bytes2.length) + ")");
-        
-        // ZIP 로컬 파일 헤더 위치 찾기
+        // ZIP 로컬 파일 헤더 시그니처 찾기
         byte[] localHeaderSignature = {0x50, 0x4B, 0x03, 0x04}; // "PK\003\004"
+        int headerPos = findSignature(allBytes, localHeaderSignature);
         
-        int[] localHeaderPositions1 = findAllSignatures(bytes1, localHeaderSignature);
-        if (localHeaderPositions1.length == 0) {
-            System.out.println("파일 1에서 ZIP 로컬 파일 헤더를 찾을 수 없습니다.");
-            return;
-        }
-        
-        // 압축된 모든 내용물 추출 및 비교
-        for (int i = 0; i < localHeaderPositions1.length; i++) {
-            int headerPos = localHeaderPositions1[i];
-            CompressedEntry entry = extractCompressedData(bytes1, headerPos);
-            
-            if (entry != null && entry.compressedData != null && entry.compressedData.length > 0) {
-                System.out.println("\n엔트리 '" + entry.filename + "' 압축 데이터 분석:");
-                System.out.println("  - 압축된 크기: " + formatFileSize(entry.compressedData.length));
-                
-                // 압축된 내용물이 파일2에 포함되어 있는지 검사
-                int matchingBytes = findMaxMatchingByteSequence(entry.compressedData, bytes2);
-                double matchPercentage = (double) matchingBytes / entry.compressedData.length * 100.0;
-                
-                System.out.printf("  - 내용물 일치도: %.2f%% (%d/%d 바이트)\n", 
-                                 matchPercentage, matchingBytes, entry.compressedData.length);
-                
-                // 압축된 내용물의 해시코드 비교 (내용이 정확히 같은지 확인)
-                int hash1 = Arrays.hashCode(entry.compressedData);
-                
-                // 파일2에서 해당 항목의 위치 찾기 시도
-                int matchPosition = findBestMatchingPosition(entry.compressedData, bytes2);
-                if (matchPosition >= 0) {
-                    System.out.println("  - 일치하는 데이터 시작 위치: " + matchPosition);
-                    
-                    // 해당 위치의 압축 데이터 헥사 덤프 출력 (처음 16바이트만)
-                    System.out.println("\n  압축된 데이터의 헥사 덤프 (처음 16바이트):");
-                    printHexDump(entry.compressedData, Math.min(16, entry.compressedData.length));
-                    
-                    // 일치 부분을 더 정확히 분석
-                    if (matchPosition + entry.compressedData.length <= bytes2.length) {
-                        byte[] matchedData = Arrays.copyOfRange(bytes2, matchPosition, 
-                                                              matchPosition + entry.compressedData.length);
-                        int hash2 = Arrays.hashCode(matchedData);
-                        
-                        boolean exactMatch = hash1 == hash2;
-                        System.out.println("  - 정확한 일치 여부: " + (exactMatch ? "예" : "아니오"));
-                        
-                        // 일치하지 않는 부분 찾기
-                        if (!exactMatch) {
-                            findDifferentBytes(entry.compressedData, matchedData);
-                        }
-                    }
-                } else {
-                    System.out.println("  - 일치하는 데이터 시작 위치를 찾을 수 없습니다.");
-                }
-            }
-        }
-        
-        System.out.println("\n==========================================");
-    }
-    
-    /**
-     * 두 바이트 배열에서 일치하지 않는 처음 몇 바이트를 찾아 출력합니다.
-     */
-    private static void findDifferentBytes(byte[] data1, byte[] data2) {
-        int diffCount = 0;
-        int maxDiffsToShow = 3;
-        
-        System.out.println("\n  일치하지 않는 바이트 위치:");
-        
-        for (int i = 0; i < Math.min(data1.length, data2.length); i++) {
-            if (data1[i] != data2[i]) {
-                diffCount++;
-                System.out.printf("    위치 %d: 0x%02X vs 0x%02X\n", 
-                                 i, data1[i] & 0xFF, data2[i] & 0xFF);
-                
-                if (diffCount >= maxDiffsToShow) {
-                    int remainingDiffs = countRemainingDiffs(data1, data2, i + 1);
-                    System.out.println("    ... 외 " + remainingDiffs + " 개의 차이점이 더 있습니다.");
-                    break;
-                }
-            }
-        }
-        
-        if (diffCount == 0) {
-            System.out.println("    차이점이 없습니다. 길이만 다를 수 있습니다.");
-        }
-    }
-    
-    /**
-     * 주어진 인덱스 이후에 일치하지 않는 바이트 수를 계산합니다.
-     */
-    private static int countRemainingDiffs(byte[] data1, byte[] data2, int startIndex) {
-        int diffCount = 0;
-        for (int i = startIndex; i < Math.min(data1.length, data2.length); i++) {
-            if (data1[i] != data2[i]) {
-                diffCount++;
-            }
-        }
-        return diffCount;
-    }
-    
-    /**
-     * ZIP 로컬 파일 헤더에서 압축된 데이터를 추출합니다.
-     */
-    private static CompressedEntry extractCompressedData(byte[] data, int headerPos) {
-        if (headerPos < 0 || headerPos + 30 >= data.length) {
+        if (headerPos < 0) {
+            System.out.println("ZIP 로컬 파일 헤더를 찾을 수 없습니다.");
             return null;
         }
         
         // 파일명 길이 (오프셋 26-27, 2바이트)
-        int filenameLength = ((data[headerPos + 26] & 0xFF) | 
-                             ((data[headerPos + 27] & 0xFF) << 8));
+        int filenameLength = ((allBytes[headerPos + 26] & 0xFF) | 
+                             ((allBytes[headerPos + 27] & 0xFF) << 8));
         
         // 추가 필드 길이 (오프셋 28-29, 2바이트)
-        int extraFieldLength = ((data[headerPos + 28] & 0xFF) | 
-                               ((data[headerPos + 29] & 0xFF) << 8));
+        int extraFieldLength = ((allBytes[headerPos + 28] & 0xFF) | 
+                               ((allBytes[headerPos + 29] & 0xFF) << 8));
         
         // 압축된 크기 (오프셋 18-21, 4바이트)
-        int compressedSize = ((data[headerPos + 18] & 0xFF) | 
-                             ((data[headerPos + 19] & 0xFF) << 8) | 
-                             ((data[headerPos + 20] & 0xFF) << 16) | 
-                             ((data[headerPos + 21] & 0xFF) << 24));
-        
-        // 압축되지 않은 크기 (오프셋 22-25, 4바이트)
-        int uncompressedSize = ((data[headerPos + 22] & 0xFF) | 
-                               ((data[headerPos + 23] & 0xFF) << 8) | 
-                               ((data[headerPos + 24] & 0xFF) << 16) | 
-                               ((data[headerPos + 25] & 0xFF) << 24));
-        
-        // 파일명 추출
-        int filenameStart = headerPos + 30;
-        if (filenameStart + filenameLength > data.length) {
-            return null;
-        }
-        
-        byte[] filenameBytes = Arrays.copyOfRange(data, filenameStart, filenameStart + filenameLength);
-        String filename = new String(filenameBytes, java.nio.charset.StandardCharsets.UTF_8);
+        int compressedSize = ((allBytes[headerPos + 18] & 0xFF) | 
+                             ((allBytes[headerPos + 19] & 0xFF) << 8) | 
+                             ((allBytes[headerPos + 20] & 0xFF) << 16) | 
+                             ((allBytes[headerPos + 21] & 0xFF) << 24));
         
         // 압축된 데이터 시작 위치
-        int dataStart = filenameStart + filenameLength + extraFieldLength;
-        if (dataStart + compressedSize > data.length) {
+        int dataStart = headerPos + 30 + filenameLength + extraFieldLength;
+        
+        // 데이터 추출
+        if (dataStart + compressedSize > allBytes.length) {
+            System.out.println("압축 데이터가 파일 범위를 초과합니다.");
             return null;
         }
         
-        // 압축된 데이터 추출
-        byte[] compressedData = Arrays.copyOfRange(data, dataStart, dataStart + compressedSize);
+        // 파일명 추출 (디버깅용)
+        String filename = "";
+        if (headerPos + 30 + filenameLength <= allBytes.length) {
+            byte[] filenameBytes = Arrays.copyOfRange(allBytes, headerPos + 30, headerPos + 30 + filenameLength);
+            filename = new String(filenameBytes, java.nio.charset.StandardCharsets.UTF_8);
+            System.out.println("파일명: " + filename);
+        }
         
-        CompressedEntry entry = new CompressedEntry();
-        entry.filename = filename;
-        entry.compressedData = compressedData;
-        entry.compressedSize = compressedSize;
-        entry.uncompressedSize = uncompressedSize;
+        System.out.println("압축 데이터 위치: " + dataStart + ", 크기: " + compressedSize);
         
-        return entry;
+        return Arrays.copyOfRange(allBytes, dataStart, dataStart + compressedSize);
     }
     
     /**
-     * 주어진 바이트 시퀀스와 가장 많이 일치하는 연속된 바이트 수를 찾습니다.
+     * Excel 파일에서 각 시트 XML의 압축된 데이터를 추출합니다.
+     * 
+     * @return 3개의 시트에 해당하는 압축된 데이터 배열
      */
-    private static int findMaxMatchingByteSequence(byte[] source, byte[] target) {
-        int maxMatchLength = 0;
+    private static byte[][] extractSheetsFromExcel(String excelFile) throws IOException {
+        byte[][] sheetData = new byte[3][];
         
-        for (int i = 0; i <= target.length - source.length; i++) {
-            int currentMatchLength = 0;
-            for (int j = 0; j < source.length && i + j < target.length; j++) {
-                if (source[j] == target[i + j]) {
-                    currentMatchLength++;
-                } else {
-                    break; // 연속된 일치만 계산
+        try (ZipFile zipFile = new ZipFile(new File(excelFile))) {
+            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+            
+            System.out.println("Excel 파일 내 ZIP 항목들:");
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                System.out.println(" - " + name + " (" + formatFileSize(entry.getCompressedSize()) + ")");
+                
+                // xl/worksheets/sheet1.xml, sheet2.xml, sheet3.xml 찾기
+                if (name.matches("xl/worksheets/sheet[1-3]\\.xml")) {
+                    int sheetNum = Integer.parseInt(name.substring(name.length() - 5, name.length() - 4)) - 1;
+                    
+                    try (InputStream is = zipFile.getInputStream(entry)) {
+                        byte[] entryData = is.readAllBytes();
+                        
+                        // 압축되기 전의 XML 데이터를 다시 압축
+                        byte[] recompressedData = recompressXmlData(entryData);
+                        sheetData[sheetNum] = recompressedData;
+                        
+                        System.out.println("   * 추출 및 재압축됨: 원본 " + formatFileSize(entryData.length) + 
+                                          " -> 압축 " + formatFileSize(recompressedData.length));
+                    }
                 }
             }
-            maxMatchLength = Math.max(maxMatchLength, currentMatchLength);
         }
         
-        return maxMatchLength;
+        return sheetData;
     }
     
     /**
-     * 소스 바이트 배열이 타겟 배열 내에서 가장 잘 일치하는 위치를 찾습니다.
+     * XML 데이터를 DEFLATE 알고리즘으로 재압축합니다.
      */
-    private static int findBestMatchingPosition(byte[] source, byte[] target) {
-        int maxMatchLength = 0;
-        int bestPosition = -1;
+    private static byte[] recompressXmlData(byte[] xmlData) throws IOException {
+        // 메모리 버퍼에 압축 결과를 저장
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
         
-        // 슬라이딩 윈도우 방식으로 가장 많이 일치하는 위치 찾기
-        for (int i = 0; i <= target.length - Math.min(50, source.length); i++) {
-            // 최소한 50 바이트 이상 연속으로 일치해야 함
-            int matchLength = countConsecutiveMatches(source, target, i);
-            if (matchLength > maxMatchLength) {
-                maxMatchLength = matchLength;
-                bestPosition = i;
-            }
-        }
+        // DEFLATE 압축 스트림 생성 (압축 레벨 4 = ExcelCreator에서 설정한 값)
+        java.util.zip.DeflaterOutputStream deflater = 
+            new java.util.zip.DeflaterOutputStream(baos, new java.util.zip.Deflater(4));
         
-        // 일정 비율 이상 일치하는 경우에만 위치 반환
-        double matchPercent = (double) maxMatchLength / source.length;
-        if (matchPercent >= 0.5) { // 50% 이상 일치하면 유의미한 것으로 판단
-            return bestPosition;
-        }
+        // 데이터 압축
+        deflater.write(xmlData);
+        deflater.finish();
+        deflater.close();
         
-        return -1;
+        // 압축된 바이트 배열 반환
+        return baos.toByteArray();
     }
     
     /**
-     * 소스 배열이 타겟 배열과 주어진 위치에서 시작하여 연속해서 일치하는 바이트 수를 계산합니다.
+     * 두 압축 데이터를 비교합니다.
      */
-    private static int countConsecutiveMatches(byte[] source, byte[] target, int targetOffset) {
-        int matchCount = 0;
-        for (int i = 0; i < source.length && targetOffset + i < target.length; i++) {
-            if (source[i] == target[targetOffset + i]) {
-                matchCount++;
+    private static void compareCompressedData(byte[] data1, byte[] data2) {
+        System.out.println("\n압축 데이터 비교 결과:");
+        
+        // 바이트 단위 비교
+        int matchingByteCount = 0;
+        int matchingSequenceStart = -1;
+        int longestSequenceLength = 0;
+        int currentSequenceLength = 0;
+        
+        int minLength = Math.min(data1.length, data2.length);
+        
+        for (int i = 0; i < minLength; i++) {
+            if (data1[i] == data2[i]) {
+                matchingByteCount++;
+                currentSequenceLength++;
+                
+                if (currentSequenceLength > longestSequenceLength) {
+                    longestSequenceLength = currentSequenceLength;
+                }
             } else {
-                break; // 연속된 일치만 계산
+                if (currentSequenceLength > 10 && matchingSequenceStart < 0) {
+                    matchingSequenceStart = i - currentSequenceLength;
+                }
+                currentSequenceLength = 0;
             }
         }
-        return matchCount;
+        
+        // 일치율 계산
+        double matchPercentage = (double) matchingByteCount / minLength * 100;
+        System.out.printf("바이트 일치율: %.2f%% (%d/%d 바이트)\n", 
+                         matchPercentage, matchingByteCount, minLength);
+        
+        if (matchingSequenceStart >= 0) {
+            System.out.println("가장 긴 연속 일치 시작 위치: " + matchingSequenceStart + 
+                             ", 길이: " + longestSequenceLength + " 바이트");
+        }
+        
+        // 처음 다른 바이트 위치 찾기
+        int firstDiffPos = -1;
+        for (int i = 0; i < minLength; i++) {
+            if (data1[i] != data2[i]) {
+                firstDiffPos = i;
+                break;
+            }
+        }
+        
+        if (firstDiffPos >= 0) {
+            System.out.println("\n첫 번째 차이점:");
+            System.out.printf("위치: %d (0x%04X)\n", firstDiffPos, firstDiffPos);
+            System.out.printf("파일 1: 0x%02X\n", data1[firstDiffPos] & 0xFF);
+            System.out.printf("파일 2: 0x%02X\n", data2[firstDiffPos] & 0xFF);
+            
+            // 차이점 주변의 헥스 덤프 출력 (차이점 전후 8바이트씩)
+            int startDump = Math.max(0, firstDiffPos - 8);
+            int endDump = Math.min(minLength, firstDiffPos + 8);
+            
+            System.out.println("\n차이점 주변 헥스 덤프 (위치 " + startDump + "-" + endDump + "):");
+            System.out.println("파일 1:");
+            printHexDump(Arrays.copyOfRange(data1, startDump, endDump), endDump - startDump);
+            System.out.println("파일 2:");
+            printHexDump(Arrays.copyOfRange(data2, startDump, endDump), endDump - startDump);
+        } else if (data1.length != data2.length) {
+            System.out.println("\n모든 공통 바이트가 일치하지만 길이가 다릅니다:");
+            System.out.println("파일 1: " + data1.length + " 바이트");
+            System.out.println("파일 2: " + data2.length + " 바이트");
+            
+            // 길이 차이가 있는 경우 추가 바이트 출력
+            if (data1.length > data2.length) {
+                System.out.println("\n파일 1의 추가 바이트 (인덱스 " + data2.length + "-" + (data1.length - 1) + "):");
+                printHexDump(Arrays.copyOfRange(data1, data2.length, data1.length), data1.length - data2.length);
+            } else {
+                System.out.println("\n파일 2의 추가 바이트 (인덱스 " + data1.length + "-" + (data2.length - 1) + "):");
+                printHexDump(Arrays.copyOfRange(data2, data1.length, data2.length), data2.length - data1.length);
+            }
+        } else {
+            System.out.println("\n모든 바이트가 100% 일치합니다!");
+        }
     }
     
     /**
-     * 주어진 바이트 배열에서 시그니처 패턴의 모든 위치를 찾습니다.
+     * null이 아닌 배열 요소 개수를 계산합니다.
      */
-    private static int[] findAllSignatures(byte[] data, byte[] signature) {
-        List<Integer> positions = new java.util.ArrayList<>();
-        
+    private static int countNonNull(Object[] array) {
+        int count = 0;
+        for (Object obj : array) {
+            if (obj != null) count++;
+        }
+        return count;
+    }
+    
+    /**
+     * 주어진 바이트 배열에서 시그니처 패턴의 첫 번째 위치를 찾습니다.
+     */
+    private static int findSignature(byte[] data, byte[] signature) {
         mainLoop:
         for (int i = 0; i <= data.length - signature.length; i++) {
             for (int j = 0; j < signature.length; j++) {
@@ -314,16 +303,9 @@ public class ZipByteComparer {
                     continue mainLoop;
                 }
             }
-            positions.add(i); // 시그니처 발견
+            return i; // 시그니처 발견
         }
-        
-        // List<Integer>를 int[]로 변환
-        int[] result = new int[positions.size()];
-        for (int i = 0; i < positions.size(); i++) {
-            result[i] = positions.get(i);
-        }
-        
-        return result;
+        return -1; // 발견되지 않음
     }
     
     /**
@@ -355,6 +337,11 @@ public class ZipByteComparer {
                 } else {
                     System.out.print("   ");
                 }
+                
+                // 8바이트마다 추가 공백
+                if (j == 7) {
+                    System.out.print(" ");
+                }
             }
             
             // 구분자
@@ -374,15 +361,5 @@ public class ZipByteComparer {
             }
             System.out.println();
         }
-    }
-    
-    /**
-     * 압축된 데이터 엔트리를 저장하는 내부 클래스
-     */
-    private static class CompressedEntry {
-        String filename;
-        byte[] compressedData;
-        int compressedSize;
-        int uncompressedSize;
     }
 }

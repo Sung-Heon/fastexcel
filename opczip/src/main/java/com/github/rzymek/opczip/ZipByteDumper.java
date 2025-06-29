@@ -20,7 +20,7 @@ public class ZipByteDumper {
                 "sheet1-compressed.zip",
                 "sheet2-compressed.zip",
                 "sheet3-compressed.zip",
-                "simple-compressed-unfinished.zip"
+                "ThreeSheets-complete.xlsx"
             );
             
             System.out.println("ZIP 파일 바이트코드 덤프를 시작합니다.");
@@ -57,7 +57,9 @@ public class ZipByteDumper {
         
         // 출력 파일명 생성
         String outputFileName = zipFile.replace(".zip", "-bytecode.txt");
-        
+        if (zipFile.equals("ThreeSheets-complete.xlsx")) {
+            outputFileName = "ThreeSheets-complete-bytecode.txt";
+        }
         // 파일 내용 출력
         try (PrintWriter writer = new PrintWriter(new FileOutputStream(outputFileName))) {
             // 파일 정보 헤더 작성
@@ -176,7 +178,7 @@ public class ZipByteDumper {
             
             // 구분자
             writer.print(" | ");
-            
+
             // ASCII 출력
             for (int j = 0; j < bytesPerLine; j++) {
                 if (i + j < data.length) {
