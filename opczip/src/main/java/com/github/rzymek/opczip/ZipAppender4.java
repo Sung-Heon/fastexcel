@@ -143,6 +143,23 @@ public class ZipAppender4 {
     }
     
     /**
+     * EOCD(End of Central Directory) 레코드 정보를 담는 데이터 클래스.
+     */
+    private static class EOCDRecord {
+        final int totalEntries;
+        final long centralDirectorySize;
+        final long centralDirectoryOffset;
+        final String comment;
+
+        EOCDRecord(int totalEntries, long centralDirectorySize, long centralDirectoryOffset, String comment) {
+            this.totalEntries = totalEntries;
+            this.centralDirectorySize = centralDirectorySize;
+            this.centralDirectoryOffset = centralDirectoryOffset;
+            this.comment = comment;
+        }
+    }
+    
+    /**
      * ZIP 파일을 세 부분으로 분리합니다: 데이터 영역, Central Directory, EOCD
      */
     private static ZipFileComponents splitZipFile(Path zipPath) throws IOException {
@@ -152,42 +169,9 @@ public class ZipAppender4 {
             long fileSize = raf.length();
             
             // 1. EOCD 파싱하여 Central Directory 위치 및 크기 확인
-            // 파일 끝에서부터 EOCD 시그니처 찾기
-            long maxScanSize = Math.min(fileSize, 65535 + 22); // EOCD + 최대 코멘트 길이
-            long scanStartPos = fileSize - 22; // 최소 EOCD 크기
+            EOCDRecord eocd = findAndParseEOCD(raf);
             
-            if (scanStartPos < 0) {
-                // 파일이 너무 작으면 비어있는 ZIP으로 처리
-                components.dataSection = new byte[0];
-                components.centralDirectory = new byte[0];
-                components.eocd = createNewEOCD(0, 0, 0);
-                components.totalEntries = 0;
-                return components;
-            }
-            
-            // 파일 끝에서부터 EOCD 시그니처 찾기
-            boolean eocdFound = false;
-            long eocdOffset = 0;
-            long cdOffset = 0;
-            long cdSize = 0;
-            int totalEntries = 0;
-            
-            for (long pos = scanStartPos; pos >= fileSize - maxScanSize && pos >= 0; pos--) {
-                raf.seek(pos);
-                if (raf.readInt() == Integer.reverseBytes(EOCD_SIGNATURE)) {
-                    eocdOffset = pos;
-                    eocdFound = true;
-                    
-                    // EOCD에서 필요한 정보 읽기
-                    raf.seek(pos + 10); // 총 엔트리 수 위치
-                    totalEntries = Short.toUnsignedInt(raf.readShort());
-                    cdSize = Integer.toUnsignedLong(raf.readInt());
-                    cdOffset = Integer.toUnsignedLong(raf.readInt());
-                    break;
-                }
-            }
-            
-            if (!eocdFound) {
+            if (eocd == null) {
                 // EOCD를 찾지 못한 경우 비어있는 ZIP으로 처리
                 components.dataSection = new byte[0];
                 components.centralDirectory = new byte[0];
@@ -196,30 +180,80 @@ public class ZipAppender4 {
                 return components;
             }
             
-            System.out.println("  - EOCD 오프셋: " + eocdOffset);
-            System.out.println("  - CD 오프셋: " + cdOffset);
-            System.out.println("  - CD 크기: " + cdSize);
-            System.out.println("  - 총 엔트리 수: " + totalEntries);
+            System.out.println("  - EOCD 파싱 결과:");
+            System.out.println("    - Central Directory 오프셋: " + eocd.centralDirectoryOffset);
+            System.out.println("    - Central Directory 크기: " + eocd.centralDirectorySize);
+            System.out.println("    - 총 엔트리 수: " + eocd.totalEntries);
+            if (!eocd.comment.isEmpty()) {
+                System.out.println("    - ZIP 주석: " + eocd.comment);
+            }
             
             // 2. 데이터 영역 (Local headers와 파일 데이터) 읽기
-            components.dataSection = new byte[(int)cdOffset];
+            components.dataSection = new byte[(int)eocd.centralDirectoryOffset];
             raf.seek(0);
             raf.readFully(components.dataSection);
             
             // 3. Central Directory 읽기
-            components.centralDirectory = new byte[(int)cdSize];
-            raf.seek(cdOffset);
+            components.centralDirectory = new byte[(int)eocd.centralDirectorySize];
+            raf.seek(eocd.centralDirectoryOffset);
             raf.readFully(components.centralDirectory);
             
             // 4. EOCD 읽기
+            long eocdOffset = eocd.centralDirectoryOffset + eocd.centralDirectorySize;
             components.eocd = new byte[(int)(fileSize - eocdOffset)];
             raf.seek(eocdOffset);
             raf.readFully(components.eocd);
             
-            components.totalEntries = totalEntries;
+            components.totalEntries = eocd.totalEntries;
         }
         
         return components;
+    }
+    
+    /**
+     * 파일 끝에서부터 EOCD 시그니처를 찾아 레코드를 파싱합니다.
+     */
+    private static EOCDRecord findAndParseEOCD(RandomAccessFile raf) throws IOException {
+        long fileSize = raf.length();
+        // EOCD는 파일 끝에 위치하며, 주석 길이에 따라 위치가 가변적입니다.
+        long scanStartPos = fileSize - 22; // 최소 EOCD 크기
+        if (scanStartPos < 0) return null;
+
+        long maxScanSize = Math.min(fileSize, 65535 + 22);
+        long searchBoundary = fileSize - maxScanSize;
+        if (searchBoundary < 0) searchBoundary = 0;
+
+        for (long pos = scanStartPos; pos >= searchBoundary; pos--) {
+            raf.seek(pos);
+            if (raf.readInt() == Integer.reverseBytes(EOCD_SIGNATURE)) {
+                raf.seek(pos);
+                ByteBuffer buffer = ByteBuffer.allocate(22);
+                buffer.order(ByteOrder.LITTLE_ENDIAN);
+                raf.getChannel().read(buffer);
+                buffer.flip();
+
+                buffer.getInt(); // 시그니처 건너뛰기
+                buffer.getShort(); // 이 디스크의 번호
+                buffer.getShort(); // CD가 시작되는 디스크 번호
+                buffer.getShort(); // 이 디스크의 엔트리 수
+
+                int totalEntries = Short.toUnsignedInt(buffer.getShort());
+                long cdSize = Integer.toUnsignedLong(buffer.getInt());
+                long cdOffset = Integer.toUnsignedLong(buffer.getInt());
+                int commentLength = Short.toUnsignedInt(buffer.getShort());
+
+                String comment = "";
+                if (commentLength > 0) {
+                    raf.seek(pos + 22);
+                    byte[] commentBytes = new byte[commentLength];
+                    raf.readFully(commentBytes);
+                    comment = new String(commentBytes, StandardCharsets.UTF_8);
+                }
+
+                return new EOCDRecord(totalEntries, cdSize, cdOffset, comment);
+            }
+        }
+        return null; // EOCD를 찾지 못함
     }
     
     /**
