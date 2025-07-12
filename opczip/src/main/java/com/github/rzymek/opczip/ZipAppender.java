@@ -7,122 +7,301 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.zip.CRC32;
 import java.util.zip.Deflater;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
+import java.util.zip.DeflaterOutputStream;
 
 /**
- * ZIP 파일에 직접 새로운 항목(entry)을 추가하는 기능을 제공하는 클래스.
- * 기존 ZIP 파일의 EOCD(End of Central Directory)를 수정하여 새로운 항목을 추가합니다.
+ * ZipAppender는 기존 ZIP 파일에 새로운 항목을 추가하는 클래스입니다.
+ * 이 클래스는 기존 ZIP 파일의 구조를 분석하고, 새로운 항목을 추가한 후
+ * Central Directory와 End of Central Directory(EOCD)를 업데이트합니다.
  */
 public class ZipAppender implements Closeable {
-    // ZIP 구조 관련 상수
-    private static final int EOCD_SIGNATURE = 0x06054B50;
-    private static final int CENTRAL_DIRECTORY_SIGNATURE = 0x02014B50;
-    private static final int LOCAL_FILE_HEADER_SIGNATURE = 0x04034B50;
-    private static final int DATA_DESCRIPTOR_SIGNATURE = 0x08074B50;
-
+    // ZIP 시그니처
+    private static final int LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
+    private static final int CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50;
+    private static final int EOCD_SIGNATURE = 0x06054b50;
+    
+    // 클래스 필드
     private final Path zipPath;
-    private final RandomAccessFile raf;
-    private final FileChannel channel;
     private final List<EntryInfo> addedEntries = new ArrayList<>();
-
-    // 기존 EOCD 정보
-    private long eocdOffset;
-    private int diskNumber;
-    private int startDiskNumber;
-    private int numEntriesOnDisk;
+    
+    // EOCD 정보
     private int totalEntries;
     private long cdSize;
     private long cdOffset;
     private int commentLength;
     private byte[] comment;
+    
+    // 임시 파일 경로
+    private Path tempPath;
+    
+    // I/O 필드
+    private RandomAccessFile originalRaf;
+    private FileChannel originalChannel;
+    private FileOutputStream outputStream;
+    private FileChannel outputChannel;
+    private long currentPosition;
+    
+    /**
+     * 항목 정보를 저장하는 내부 클래스
+     */
+    private static class EntryInfo {
+        String name;
+        int method;
+        int size;
+        int compressedSize;
+        long crc;
+        long localHeaderOffset;
+    }
 
     /**
-     * 기존 ZIP 파일을 열고 EOCD를 파싱합니다.
+     * 기존 ZIP 파일을 열고 분석합니다.
      *
-     * @param zipPath 기존 ZIP 파일의 경로
+     * @param zipPath ZIP 파일 경로
      * @throws IOException I/O 오류 발생시
      */
     public ZipAppender(Path zipPath) throws IOException {
         this.zipPath = zipPath;
-
+        
         // 파일이 존재하지 않으면 빈 ZIP 파일 생성
         if (!Files.exists(zipPath)) {
             try (FileOutputStream fos = new FileOutputStream(zipPath.toFile());
-                 ZipOutputStream zos = new ZipOutputStream(fos)) {
+                 java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(fos)) {
                 zos.finish();
             }
+            System.out.println("[DEBUG] 새 ZIP 파일 생성: " + zipPath);
         }
-
-        this.raf = new RandomAccessFile(zipPath.toFile(), "rw");
-        this.channel = raf.getChannel();
-
-        // EOCD 파싱
+        
+        // 원본 파일 열기 (읽기 전용)
+        this.originalRaf = new RandomAccessFile(zipPath.toFile(), "r");
+        this.originalChannel = originalRaf.getChannel();
+        
+        // 원본 파일에서 EOCD 및 CD 정보 파싱
         parseEocd();
+        
+        // 임시 파일 생성 및 열기 (쓰기 모드)
+        Path parent = zipPath.getParent();
+        if (parent != null) {
+            this.tempPath = Files.createTempFile(parent, 
+                                               zipPath.getFileName().toString(), ".tmp");
+        } else {
+            // 부모 경로가 없는 경우 시스템 임시 디렉토리 사용
+            this.tempPath = Files.createTempFile(
+                                zipPath.getFileName().toString(), ".tmp");
+        }
+        
+        // 원본 파일 내용을 임시 파일로 복사
+        Files.copy(zipPath, tempPath, StandardCopyOption.REPLACE_EXISTING);
+        
+        // 임시 파일을 쓰기 모드로 열기
+        this.outputStream = new FileOutputStream(tempPath.toFile(), true);
+        this.outputChannel = outputStream.getChannel();
+        
+        // 현재 쓰기 위치는 파일 끝 (다음 로컬 파일 헤더가 작성될 위치)
+        this.currentPosition = outputChannel.size();
+        
+        System.out.println("[DEBUG] ZipAppender 초기화 - 원본 크기: " + originalChannel.size() + 
+                          ", 항목 수: " + totalEntries + 
+                          ", CD 오프셋: " + cdOffset + 
+                          ", CD 크기: " + cdSize);
     }
-
+    
     /**
-     * ZIP 파일의 EOCD를 찾아 파싱합니다.
+     * 압축 메서드로 텍스트 항목을 추가합니다.
      *
+     * @param name 항목 이름
+     * @param content 텍스트 내용
      * @throws IOException I/O 오류 발생시
      */
+    public void addTextEntry(String name, String content) throws IOException {
+        addEntry(name, content.getBytes(), 6); // 기본 압축 레벨 6
+    }
+    
+    /**
+     * 지정한 압축 수준으로 항목을 추가합니다.
+     *
+     * @param name 항목 이름
+     * @param data 항목 데이터
+     * @param compressionLevel 압축 수준 (0-9, 0은 압축 없음)
+     * @throws IOException I/O 오류 발생시
+     */
+    public void addEntry(String name, byte[] data, int compressionLevel) throws IOException {
+        System.out.println("[DEBUG] 항목 추가 시작: " + name);
+        System.out.println("[DEBUG] 원본 데이터 크기: " + data.length + " 바이트");
+        
+        // CRC 계산
+        CRC32 crc = new CRC32();
+        crc.update(data);
+        long crcValue = crc.getValue();
+        
+        // 데이터 압축 (압축 수준이 0이면 압축하지 않음)
+        byte[] compressedData;
+        int method;
+        
+        if (compressionLevel == 0) {
+            compressedData = data;
+            method = 0; // STORED
+        } else {
+            compressedData = compressData(data, compressionLevel);
+            
+            // 압축 결과가 원본보다 크면 압축하지 않음
+            if (compressedData.length >= data.length) {
+                compressedData = data;
+                method = 0; // STORED
+            } else {
+                method = 8; // DEFLATED
+            }
+        }
+        
+        // 파일명 바이트로 변환
+        byte[] nameBytes = name.getBytes();
+        int nameLength = nameBytes.length;
+        System.out.println("[DEBUG] 파일명 바이트 길이: " + nameLength);
+        
+        // 로컬 파일 헤더 크기 계산
+        int localHeaderSize = 30 + nameLength; // 로컬 헤더(30) + 파일명 길이
+        System.out.println("[DEBUG] 로컬 파일 헤더 크기: " + localHeaderSize + " 바이트");
+        
+        // 로컬 파일 헤더 작성
+        ByteBuffer headerBuffer = ByteBuffer.allocate(localHeaderSize);
+        headerBuffer.order(ByteOrder.LITTLE_ENDIAN);
+        
+        headerBuffer.putInt(LOCAL_FILE_HEADER_SIGNATURE);
+        headerBuffer.putShort((short) 20); // 버전 (2.0)
+        headerBuffer.putShort((short) 0);  // 플래그
+        headerBuffer.putShort((short) method); // 압축 방식 (0:저장, 8:deflate)
+        headerBuffer.putShort((short) 0);  // 수정 시간
+        headerBuffer.putShort((short) 0);  // 수정 날짜
+        headerBuffer.putInt((int) crcValue); // CRC-32
+        headerBuffer.putInt(compressedData.length); // 압축된 크기
+        headerBuffer.putInt(data.length); // 압축 해제된 크기
+        headerBuffer.putShort((short) nameLength); // 파일명 길이
+        headerBuffer.putShort((short) 0);  // 추가 필드 길이
+        headerBuffer.put(nameBytes); // 파일명
+        headerBuffer.flip();
+        
+        // 항목 정보 생성
+        EntryInfo entry = new EntryInfo();
+        entry.name = name;
+        entry.method = method;
+        entry.size = data.length;
+        entry.compressedSize = compressedData.length;
+        entry.crc = crcValue;
+        entry.localHeaderOffset = currentPosition;
+        addedEntries.add(entry);
+        
+        // 로컬 파일 헤더 쓰기
+        outputChannel.position(currentPosition);
+        outputChannel.write(headerBuffer);
+        
+        // 압축된 데이터 쓰기
+        outputChannel.write(ByteBuffer.wrap(compressedData));
+        
+        // 현재 위치 업데이트
+        currentPosition += localHeaderSize + compressedData.length;
+    }
+    
+    /**
+     * 기본 압축 수준으로 항목을 추가합니다.
+     *
+     * @param name 항목 이름
+     * @param data 항목 데이터
+     * @throws IOException I/O 오류 발생시
+     */
+    public void addEntry(String name, byte[] data) throws IOException {
+        addEntry(name, data, 6); // 기본 압축 레벨 6
+    }
+    
+    /**
+     * 압축 메서드를 사용하여 데이터를 압축합니다.
+     *
+     * @param data 원본 데이터
+     * @param level 압축 수준 (1-9)
+     * @return 압축된 데이터
+     */
+    private byte[] compressData(byte[] data, int level) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        Deflater deflater = new Deflater(level, true); // true = nowrap (ZLib 헤더 없이)
+        
+        try (DeflaterOutputStream dos = new DeflaterOutputStream(baos, deflater)) {
+            dos.write(data);
+        }
+        
+        return baos.toByteArray();
+    }
+    
+    /**
+     * EOCD를 파싱하여 Central Directory 정보를 읽습니다.
+     */
     private void parseEocd() throws IOException {
-        long fileLength = raf.length();
-        if (fileLength < 22) {
-            // 최소 EOCD 크기보다 작으면 빈 ZIP으로 초기화
-            initializeEmptyZip();
+        long fileSize = originalChannel.size();
+        
+        // 작은 파일은 빈 파일로 처리
+        if (fileSize < 22) {
+            totalEntries = 0;
+            cdSize = 0;
+            cdOffset = 0;
+            commentLength = 0;
+            comment = new byte[0];
             return;
         }
-
-        // EOCD 검색을 위한 버퍼 크기 계산 (주석 최대 길이 + EOCD 크기)
-        int bufferSize = (int) Math.min(fileLength, 65535 + 22);
-        byte[] buffer = new byte[bufferSize];
-
+        
+        // 파일 끝에서 EOCD를 찾기 위한 최대 버퍼 크기 계산
+        // (EOCD는 최대 64K 주석을 가질 수 있음)
+        int maxBufferSize = Math.min((int)fileSize, 65536 + 22);
+        ByteBuffer searchBuffer = ByteBuffer.allocate(maxBufferSize);
+        
         // 파일 끝에서부터 읽기
-        raf.seek(fileLength - bufferSize);
-        raf.readFully(buffer);
-
-        // EOCD 시그니처 검색
-        int eocdOffsetInBuffer = -1;
-        for (int i = bufferSize - 4; i >= 0; i--) {
-            if (buffer[i] == 0x50 && buffer[i + 1] == 0x4B &&
-                buffer[i + 2] == 0x05 && buffer[i + 3] == 0x06) {
-                int commentLen = (buffer[i + 20] & 0xFF) | ((buffer[i + 21] & 0xFF) << 8);
-                // 주석 길이가 파일 끝까지의 거리와 일치하는지 확인
-                if (fileLength - (fileLength - bufferSize + i + 22 + commentLen) == 0) {
-                    eocdOffsetInBuffer = i;
+        originalChannel.position(fileSize - maxBufferSize);
+        originalChannel.read(searchBuffer);
+        searchBuffer.flip();
+        
+        // EOCD 시그니처 찾기
+        int eocdPos = -1;
+        for (int i = searchBuffer.limit() - 22; i >= 0; i--) {
+            if (searchBuffer.get(i) == 0x50 && 
+                searchBuffer.get(i + 1) == 0x4B && 
+                searchBuffer.get(i + 2) == 0x05 && 
+                searchBuffer.get(i + 3) == 0x06) {
+                
+                // 확인: 이 위치에서 EOCD가 파일 끝까지의 거리와 일치하는지
+                int commentLen = (searchBuffer.get(i + 20) & 0xFF) | 
+                                ((searchBuffer.get(i + 21) & 0xFF) << 8);
+                if ((searchBuffer.limit() - i - 22) == commentLen) {
+                    eocdPos = i;
                     break;
                 }
             }
         }
-
-        if (eocdOffsetInBuffer == -1) {
-            // EOCD를 찾을 수 없으면 빈 ZIP으로 초기화
-            initializeEmptyZip();
+        
+        // EOCD를 찾지 못했으면 빈 ZIP으로 처리
+        if (eocdPos == -1) {
+            totalEntries = 0;
+            cdSize = 0;
+            cdOffset = 0;
+            commentLength = 0;
+            comment = new byte[0];
             return;
         }
-
-        // 실제 파일 내의 EOCD 오프셋 계산
-        eocdOffset = fileLength - bufferSize + eocdOffsetInBuffer;
-        ByteBuffer eocdBuffer = ByteBuffer.wrap(buffer, eocdOffsetInBuffer, buffer.length - eocdOffsetInBuffer);
+        
+        // EOCD 데이터 파싱
+        ByteBuffer eocdBuffer = ((ByteBuffer)searchBuffer.position(eocdPos)).slice();
         eocdBuffer.order(ByteOrder.LITTLE_ENDIAN);
-
+        
         // EOCD 필드 파싱
-        eocdBuffer.position(eocdOffsetInBuffer + 4); // 시그니처 건너뛰기
-
-        diskNumber = eocdBuffer.getShort() & 0xFFFF;
-        startDiskNumber = eocdBuffer.getShort() & 0xFFFF;
-        numEntriesOnDisk = eocdBuffer.getShort() & 0xFFFF;
+        int signature = eocdBuffer.getInt();  // 0x06054b50
+        eocdBuffer.getShort();  // 디스크 번호
+        eocdBuffer.getShort();  // CD 시작 디스크
+        int entriesOnDisk = eocdBuffer.getShort() & 0xFFFF;
         totalEntries = eocdBuffer.getShort() & 0xFFFF;
         cdSize = eocdBuffer.getInt() & 0xFFFFFFFFL;
         cdOffset = eocdBuffer.getInt() & 0xFFFFFFFFL;
         commentLength = eocdBuffer.getShort() & 0xFFFF;
-
+        
         // 주석이 있으면 읽기
         if (commentLength > 0) {
             comment = new byte[commentLength];
@@ -133,249 +312,136 @@ public class ZipAppender implements Closeable {
     }
 
     /**
-     * 빈 ZIP 파일로 초기화합니다.
+     * Central Directory를 작성하고 파일을 마무리합니다.
      */
-    private void initializeEmptyZip() throws IOException {
-        raf.setLength(0);
-
-        // 빈 ZIP 파일의 EOCD 초기화
-        ByteBuffer eocdBuffer = ByteBuffer.allocate(22);
-        eocdBuffer.order(ByteOrder.LITTLE_ENDIAN);
-        eocdBuffer.putInt(EOCD_SIGNATURE);
-        eocdBuffer.putShort((short) 0); // diskNumber
-        eocdBuffer.putShort((short) 0); // startDiskNumber
-        eocdBuffer.putShort((short) 0); // numEntriesOnDisk
-        eocdBuffer.putShort((short) 0); // totalEntries
-        eocdBuffer.putInt(0); // cdSize
-        eocdBuffer.putInt(0); // cdOffset
-        eocdBuffer.putShort((short) 0); // commentLength
-        eocdBuffer.flip();
-
-        // 파일에 쓰기
-        channel.position(0);
-        channel.write(eocdBuffer);
-
-        // 필드 초기화
-        eocdOffset = 0;
-        diskNumber = 0;
-        startDiskNumber = 0;
-        numEntriesOnDisk = 0;
-        totalEntries = 0;
-        cdSize = 0;
-        cdOffset = 0;
-        commentLength = 0;
-        comment = new byte[0];
-    }
-
-    /**
-     * ZIP 파일에 새 항목을 추가합니다.
-     *
-     * @param entryName 추가할 항목의 이름
-     * @param data 항목의 데이터
-     * @throws IOException I/O 오류 발생시
-     */
-    public void addEntry(String entryName, byte[] data) throws IOException {
-        addEntry(entryName, data, Deflater.DEFAULT_COMPRESSION);
-    }
-
-    /**
-     * ZIP 파일에 새 항목을 압축 레벨을 지정하여 추가합니다.
-     *
-     * @param entryName 추가할 항목의 이름
-     * @param data 항목의 데이터
-     * @param compressionLevel 압축 레벨 (0-9, 0은 압축 없음)
-     * @throws IOException I/O 오류 발생시
-     */
-    public void addEntry(String entryName, byte[] data, int compressionLevel) throws IOException {
-        // 이미 추가된 항목이나 기존 항목과 이름이 충돌하는지 확인
-        // 실제 구현에서는 기존 항목 확인 로직 추가 필요
-
-        // 추가할 위치 계산 (기존 CD 시작 위치)
-        long fileSize = raf.length();
-        long newDataOffset = cdOffset;
-
-        // 1. 파일 포인터를 추가할 위치로 이동
-        channel.position(newDataOffset);
-
-        // 데이터 압축
-        byte[] compressedData;
-        int method = ZipEntry.DEFLATED;
-        CRC32 crc = new CRC32();
-        crc.update(data);
-        long crcValue = crc.getValue();
-
-        if (compressionLevel == 0) {
-            // 압축 없음
-            compressedData = data;
-            method = ZipEntry.STORED;
-        } else {
-            // 데이터 압축
-            Deflater deflater = new Deflater(compressionLevel);
-            deflater.setInput(data);
-            deflater.finish();
-
-            ByteArrayOutputStream baos = new ByteArrayOutputStream(data.length);
-            byte[] buffer = new byte[1024];
-            while (!deflater.finished()) {
-                int count = deflater.deflate(buffer);
-                baos.write(buffer, 0, count);
-            }
-            deflater.end();
-
-            compressedData = baos.toByteArray();
-
-            // 압축 효과가 없으면 압축하지 않음
-            if (compressedData.length >= data.length) {
-                compressedData = data;
-                method = ZipEntry.STORED;
-            }
-        }
-
-        // 2. Local File Header 작성
-        ByteBuffer localHeaderBuffer = ByteBuffer.allocate(30 + entryName.getBytes().length);
-        localHeaderBuffer.order(ByteOrder.LITTLE_ENDIAN);
-
-        localHeaderBuffer.putInt(LOCAL_FILE_HEADER_SIGNATURE); // 로컬 파일 헤더 시그니처
-        localHeaderBuffer.putShort((short) 20); // 버전 (2.0)
-        localHeaderBuffer.putShort((short) 0); // 플래그
-        localHeaderBuffer.putShort((short) method); // 압축 방식
-        localHeaderBuffer.putShort((short) 0); // 수정 시간
-        localHeaderBuffer.putShort((short) 0); // 수정 날짜
-        localHeaderBuffer.putInt((int) crcValue); // CRC-32
-        localHeaderBuffer.putInt(compressedData.length); // 압축된 크기
-        localHeaderBuffer.putInt(data.length); // 압축 해제된 크기
-        localHeaderBuffer.putShort((short) entryName.getBytes().length); // 파일명 길이
-        localHeaderBuffer.putShort((short) 0); // 추가 필드 길이
-        localHeaderBuffer.put(entryName.getBytes()); // 파일명
-        localHeaderBuffer.flip();
-
-        // 로컬 파일 헤더 쓰기
-        channel.write(localHeaderBuffer);
-
-        // 3. 압축된 데이터 쓰기
-        channel.write(ByteBuffer.wrap(compressedData));
-
-        // 4. 추가된 항목 정보 저장
-        EntryInfo entryInfo = new EntryInfo();
-        entryInfo.name = entryName;
-        entryInfo.method = method;
-        entryInfo.crc = crcValue;
-        entryInfo.compressedSize = compressedData.length;
-        entryInfo.size = data.length;
-        entryInfo.localHeaderOffset = newDataOffset;
-
-        addedEntries.add(entryInfo);
-
-        // 5. 다음 파일 위치 계산
-        long nextFilePos = channel.position();
-
-        // 6. 기존 Central Directory 읽기
-        byte[] centralDirectory = null;
-        if (cdSize > 0) {
-            centralDirectory = new byte[(int) cdSize];
-            channel.position(cdOffset);
-            ByteBuffer cdBuffer = ByteBuffer.wrap(centralDirectory);
-            channel.read(cdBuffer);
-        }
-
-        // 7. 새로운 Central Directory 항목들 작성
-        ByteBuffer newCdBuffer = ByteBuffer.allocate(46 * addedEntries.size());
-        newCdBuffer.order(ByteOrder.LITTLE_ENDIAN);
-
-        for (EntryInfo entry : addedEntries) {
-            newCdBuffer.putInt(CENTRAL_DIRECTORY_SIGNATURE); // 중앙 디렉터리 시그니처
-            newCdBuffer.putShort((short) 20); // 생성 버전 (2.0)
-            newCdBuffer.putShort((short) 20); // 추출 버전 (2.0)
-            newCdBuffer.putShort((short) 0); // 플래그
-            newCdBuffer.putShort((short) entry.method); // 압축 방식
-            newCdBuffer.putShort((short) 0); // 수정 시간
-            newCdBuffer.putShort((short) 0); // 수정 날짜
-            newCdBuffer.putInt((int) entry.crc); // CRC-32
-            newCdBuffer.putInt(entry.compressedSize); // 압축된 크기
-            newCdBuffer.putInt(entry.size); // 압축 해제된 크기
-            newCdBuffer.putShort((short) entry.name.getBytes().length); // 파일명 길이
-            newCdBuffer.putShort((short) 0); // 추가 필드 길이
-            newCdBuffer.putShort((short) 0); // 파일 주석 길이
-            newCdBuffer.putShort((short) 0); // 디스크 번호
-            newCdBuffer.putShort((short) 0); // 내부 파일 속성
-            newCdBuffer.putInt(0); // 외부 파일 속성
-            newCdBuffer.putInt((int) entry.localHeaderOffset); // 로컬 파일 헤더 오프셋
-            newCdBuffer.put(entry.name.getBytes()); // 파일명
-        }
-        newCdBuffer.flip();
-
-        // 8. 새 Central Directory 시작 위치에 쓰기
-        channel.position(nextFilePos);
-        channel.write(newCdBuffer);
-
-        // 9. 기존 Central Directory 쓰기 (있는 경우)
-        if (centralDirectory != null) {
-            channel.write(ByteBuffer.wrap(centralDirectory));
-        }
-
-        // 10. 업데이트된 EOCD 작성
-        long newCdOffset = nextFilePos;
-        long newCdSize = newCdBuffer.capacity() + cdSize;
-        int newTotalEntries = totalEntries + addedEntries.size();
-
-        ByteBuffer eocdBuffer = ByteBuffer.allocate(22 + commentLength);
-        eocdBuffer.order(ByteOrder.LITTLE_ENDIAN);
-        eocdBuffer.putInt(EOCD_SIGNATURE);
-        eocdBuffer.putShort((short) diskNumber);
-        eocdBuffer.putShort((short) startDiskNumber);
-        eocdBuffer.putShort((short) newTotalEntries);
-        eocdBuffer.putShort((short) newTotalEntries);
-        eocdBuffer.putInt((int) newCdSize);
-        eocdBuffer.putInt((int) newCdOffset);
-        eocdBuffer.putShort((short) commentLength);
-        if (commentLength > 0) {
-            eocdBuffer.put(comment);
-        }
-        eocdBuffer.flip();
-
-        channel.write(eocdBuffer);
-
-        // 11. 필드 업데이트
-        cdOffset = newCdOffset;
-        cdSize = newCdSize;
-        totalEntries = newTotalEntries;
-        numEntriesOnDisk = totalEntries;
-        eocdOffset = channel.position() - eocdBuffer.capacity();
-
-        // 변경된 내용을 디스크에 강제 기록
-        channel.force(true);
-    }
-
-    /**
-     * ZIP 파일에 텍스트 파일 항목을 추가합니다.
-     *
-     * @param entryName 추가할 항목의 이름
-     * @param text 텍스트 내용
-     * @throws IOException I/O 오류 발생시
-     */
-    public void addTextEntry(String entryName, String text) throws IOException {
-        addEntry(entryName, text.getBytes());
-    }
-
     @Override
     public void close() throws IOException {
-        if (channel != null && channel.isOpen()) {
-            channel.close();
+        try {
+            // 새로운 Central Directory 시작 위치
+            long newCdOffset = currentPosition;
+            System.out.println("[DEBUG] 새 CD 시작 위치: " + newCdOffset);
+            
+            // 1. 기존 Central Directory 복사
+            if (totalEntries > 0 && cdSize > 0) {
+                // 원본 파일의 CD 위치로 이동
+                originalChannel.position(cdOffset);
+                
+                // 버퍼를 통해 CD 복사
+                ByteBuffer cdBuffer = ByteBuffer.allocate(8192);
+                long remaining = cdSize;
+                
+                while (remaining > 0) {
+                    cdBuffer.clear();
+                    int toRead = (int) Math.min(cdBuffer.capacity(), remaining);
+                    cdBuffer.limit(toRead);
+                    
+                    int bytesRead = originalChannel.read(cdBuffer);
+                    if (bytesRead <= 0) break;
+                    
+                    cdBuffer.flip();
+                    outputChannel.write(cdBuffer);
+                    
+                    remaining -= bytesRead;
+                }
+                
+                System.out.println("[DEBUG] 기존 CD 복사 완료 - " + cdSize + " 바이트");
+            }
+            
+            // 2. 새로 추가된 항목들의 Central Directory 항목 작성
+            long newEntriesCdSize = 0;
+            if (!addedEntries.isEmpty()) {
+                for (EntryInfo entry : addedEntries) {
+                    byte[] nameBytes = entry.name.getBytes();
+                    int entrySize = 46 + nameBytes.length;
+                    
+                    ByteBuffer cdEntry = ByteBuffer.allocate(entrySize);
+                    cdEntry.order(ByteOrder.LITTLE_ENDIAN);
+                    
+                    cdEntry.putInt(CENTRAL_DIRECTORY_SIGNATURE);
+                    cdEntry.putShort((short) 20); // 버전 생성자
+                    cdEntry.putShort((short) 20); // 버전 추출자
+                    cdEntry.putShort((short) 0);  // 플래그
+                    cdEntry.putShort((short) entry.method); // 압축 방식
+                    cdEntry.putShort((short) 0);  // 마지막 수정 시간
+                    cdEntry.putShort((short) 0);  // 마지막 수정 날짜
+                    cdEntry.putInt((int) entry.crc); // CRC-32
+                    cdEntry.putInt(entry.compressedSize); // 압축된 크기
+                    cdEntry.putInt(entry.size); // 압축 해제된 크기
+                    cdEntry.putShort((short) nameBytes.length); // 파일명 길이
+                    cdEntry.putShort((short) 0);  // 추가 필드 길이
+                    cdEntry.putShort((short) 0);  // 파일 주석 길이
+                    cdEntry.putShort((short) 0);  // 디스크 번호 시작
+                    cdEntry.putShort((short) 0);  // 내부 파일 속성
+                    cdEntry.putInt(0); // 외부 파일 속성
+                    cdEntry.putInt((int) entry.localHeaderOffset); // 로컬 헤더 상대 오프셋
+                    cdEntry.put(nameBytes); // 파일명
+                    
+                    cdEntry.flip();
+                    outputChannel.write(cdEntry);
+                    
+                    newEntriesCdSize += entrySize;
+                    System.out.println("[DEBUG] 새 CD 항목 작성: " + entry.name + " - " + entrySize + " 바이트");
+                }
+                
+                System.out.println("[DEBUG] 새 CD 항목 작성 완료 - " + newEntriesCdSize + " 바이트");
+            }
+            
+            // 3. 새 EOCD 작성
+            long newTotalCdSize = cdSize + newEntriesCdSize;
+            int newTotalEntries = totalEntries + addedEntries.size();
+            
+            // EOCD 위치
+            long eocdOffset = currentPosition + newTotalCdSize;
+            
+            // EOCD 헤더 작성
+            ByteBuffer eocd = ByteBuffer.allocate(22 + commentLength);
+            eocd.order(ByteOrder.LITTLE_ENDIAN);
+            
+            eocd.putInt(EOCD_SIGNATURE); // 시그니처
+            eocd.putShort((short) 0); // 디스크 번호
+            eocd.putShort((short) 0); // 시작 디스크
+            eocd.putShort((short) newTotalEntries); // 디스크의 항목 수
+            eocd.putShort((short) newTotalEntries); // 전체 항목 수
+            eocd.putInt((int) newTotalCdSize); // CD 크기
+            eocd.putInt((int) newCdOffset); // CD 시작 위치
+            eocd.putShort((short) commentLength); // 주석 길이
+            
+            // 기존 주석 복사
+            if (commentLength > 0) {
+                eocd.put(comment);
+            }
+            
+            eocd.flip();
+            outputChannel.write(eocd);
+            
+            System.out.println("[DEBUG] EOCD 작성 완료 - 위치: " + eocdOffset);
+            System.out.println("[DEBUG] EOCD 정보 - 새 CD 오프셋: " + newCdOffset);
+            System.out.println("[DEBUG] EOCD 정보 - 기존 CD 크기: " + cdSize + " 바이트");
+            System.out.println("[DEBUG] EOCD 정보 - 새 항목 CD 크기: " + newEntriesCdSize + " 바이트");
+            System.out.println("[DEBUG] EOCD 정보 - 총 CD 크기: " + newTotalCdSize + " 바이트");
+            System.out.println("[DEBUG] EOCD 정보 - 기존 항목 수: " + totalEntries);
+            System.out.println("[DEBUG] EOCD 정보 - 새 항목 수: " + addedEntries.size());
+            System.out.println("[DEBUG] EOCD 정보 - 총 항목 수: " + newTotalEntries);
+            
+            // 모든 스트림 닫기
+            outputStream.close();
+            originalRaf.close();
+            
+            // 임시 파일을 원본 파일로 대체
+            Files.move(tempPath, zipPath, StandardCopyOption.REPLACE_EXISTING);
+            
+            System.out.println("[DEBUG] ZIP 파일 업데이트 완료");
+        } catch (Exception e) {
+            // 예외 발생 시 리소스 정리
+            try {
+                if (outputStream != null) outputStream.close();
+                if (originalRaf != null) originalRaf.close();
+                // 임시 파일 삭제
+                Files.deleteIfExists(tempPath);
+            } catch (IOException ex) {
+                e.addSuppressed(ex);
+            }
+            throw e;
         }
-        if (raf != null) {
-            raf.close();
-        }
-    }
-
-    /**
-     * ZIP 항목 정보를 저장하는 내부 클래스
-     */
-    private static class EntryInfo {
-        String name;
-        int method;
-        long crc;
-        int compressedSize;
-        int size;
-        long localHeaderOffset;
     }
 }
