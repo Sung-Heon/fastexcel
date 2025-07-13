@@ -372,7 +372,7 @@ public class ZipAppender4 {
     public static void main(String[] args) {
         try {
             // 테스트용 ZIP 파일 준비
-            Path zipPath = Paths.get("new_archive.zip");
+            Path zipPath = Paths.get("example.zip");
             Path fileToAdd1 = Paths.get("file_to_add.txt");
             Path fileToAdd2 = Paths.get("file_to_add2.txt");
             
