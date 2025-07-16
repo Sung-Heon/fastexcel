@@ -62,7 +62,7 @@ class ZipAssemblerTest {
             while ((len = zis.read(buffer)) > 0) {
                 baos.write(buffer, 0, len);
             }
-            assertEquals(content1, baos.toString(StandardCharsets.UTF_8));
+            assertEquals(content1, baos.toString(StandardCharsets.UTF_8.name()));
             
             // Check second entry
             entry = zis.getNextEntry();
@@ -73,7 +73,7 @@ class ZipAssemblerTest {
             while ((len = zis.read(buffer)) > 0) {
                 baos.write(buffer, 0, len);
             }
-            assertEquals(content2, baos.toString(StandardCharsets.UTF_8));
+            assertEquals(content2, baos.toString(StandardCharsets.UTF_8.name()));
             
             // Should be no more entries
             assertNull(zis.getNextEntry());
