@@ -18,13 +18,13 @@ public class ExcelCompressionDemo {
         try {
             // 1. 간단한 Excel 파일 생성 데모
             demonstrateSimpleExcelCreation();
-            
+
             // 2. 다중 시트 Excel 파일 생성 데모
             demonstrateMultiSheetExcelCreation();
-            
+
             // 3. 대용량 Excel 파일 생성 데모
             demonstrateLargeExcelCreation();
-            
+
             // 4. 성능 비교 데모
             demonstratePerformanceComparison();
             

@@ -176,22 +176,24 @@ public class MultiThreadedExcelCompressor implements AutoCloseable {
      * @throws IOException 압축 중 오류 발생시
      */
     private SingleFileCompressionResult createMetadataResult(String fileName, byte[] data) throws IOException {
-        // 메타데이터 파일은 압축하지 않고 저장 (store method)
         long startTime = System.nanoTime();
-// ... your existing code to prepare the data ...
+        
+        // 메타데이터 파일은 압축하지 않고 저장 (STORE method)
+        // 작은 XML 파일들은 압축 효과가 적고 STORE가 더 안정적임
+        long crc32 = calculateCrc32(data);
+        long dosTime = toDosTime(java.time.LocalDateTime.now());
         long compressionTimeNanos = System.nanoTime() - startTime;
 
         return new SingleFileCompressionResult(
                 fileName,
-                createStoreLocalHeader(fileName, data),
-                data,  // 압축하지 않음
-                calculateCrc32(data),
+                null,  // ZipAssembler가 로컬 헤더를 생성함
+                data,  // 압축하지 않음 (STORE method)
+                crc32,
                 data.length,
                 data.length,  // 압축하지 않으므로 같은 크기
-                toDosTime(java.time.LocalDateTime.now()),
-                0,
-                Duration.ofNanos(compressionTimeNanos)  // Add this line
-
+                dosTime,
+                0,  // ZipAssembler가 오프셋을 설정함
+                Duration.ofNanos(compressionTimeNanos)
         );
     }
 
@@ -364,36 +366,6 @@ public class MultiThreadedExcelCompressor implements AutoCloseable {
                     }
                 }
         );
-    }
-
-    /**
-     * Store 방식의 로컬 헤더를 생성합니다 (압축하지 않음).
-     *
-     * @param fileName 파일 이름
-     * @param data     파일 데이터
-     * @return 로컬 헤더 바이트 배열
-     */
-    private byte[] createStoreLocalHeader(String fileName, byte[] data) {
-        byte[] fileNameBytes = fileName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        long dosTime = toDosTime(java.time.LocalDateTime.now());
-        long crc32 = calculateCrc32(data);
-
-        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(30 + fileNameBytes.length);
-        buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN);
-
-        buffer.putInt(0x04034b50);                   // 시그니처
-        buffer.putShort((short) 20);                 // Version needed to extract
-        buffer.putShort((short) 0);                  // General purpose bit flag
-        buffer.putShort((short) 0);                  // Compression method (STORE)
-        buffer.putInt((int) dosTime);                // Last mod file time & date
-        buffer.putInt((int) crc32);                  // CRC-32
-        buffer.putInt(data.length);                  // Compressed size
-        buffer.putInt(data.length);                  // Uncompressed size
-        buffer.putShort((short) fileNameBytes.length); // File name length
-        buffer.putShort((short) 0);                  // Extra field length
-        buffer.put(fileNameBytes);                   // File name
-
-        return buffer.array();
     }
 
     /**

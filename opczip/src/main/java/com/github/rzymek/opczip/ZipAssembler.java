@@ -53,9 +53,18 @@ public class ZipAssembler {
             // Write local headers and compressed data
             long currentOffset = 0;
             for (SingleFileCompressionResult result : results) {
+                // Set the local header offset for central directory
+                result.setLocalHeaderOffset(currentOffset);
+                
+                // Create local header if not provided
+                byte[] localHeader = result.getLocalHeader();
+                if (localHeader == null) {
+                    localHeader = createLocalHeader(result);
+                }
+                
                 // Write local header
-                channel.write(ByteBuffer.wrap(result.getLocalHeader()), currentOffset);
-                currentOffset += result.getLocalHeader().length;
+                channel.write(ByteBuffer.wrap(localHeader), currentOffset);
+                currentOffset += localHeader.length;
                 
                 // Write compressed data
                 channel.write(ByteBuffer.wrap(result.getCompressedData()), currentOffset);
@@ -90,6 +99,10 @@ public class ZipAssembler {
     private byte[] createCentralDirectoryEntry(SingleFileCompressionResult result) {
         byte[] fileNameBytes = result.getEntryName().getBytes(StandardCharsets.UTF_8);
         
+        // Determine compression method based on whether data was actually compressed
+        short compressionMethod = (result.getCompressedSize() == result.getUncompressedSize()) ? 
+                                  (short) 0 : (short) 8; // 0 = STORE, 8 = DEFLATE
+        
         ByteBuffer buffer = ByteBuffer.allocate(46 + fileNameBytes.length);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
         
@@ -97,7 +110,7 @@ public class ZipAssembler {
         buffer.putShort((short) 0x033F);        // Version made by (6.3 = ZIP 6.3)
         buffer.putShort((short) 20);            // Version needed to extract
         buffer.putShort((short) 0);             // General purpose bit flag
-        buffer.putShort((short) 8);             // Compression method (DEFLATE)
+        buffer.putShort(compressionMethod);     // Compression method (STORE or DEFLATE)
         buffer.putInt((int) result.getDosTime()); // Last mod file time & date
         buffer.putInt((int) result.getCrc32()); // CRC-32
         
@@ -148,6 +161,43 @@ public class ZipAssembler {
         buffer.putInt(centralDirSize);          // Size of central directory
         buffer.putInt(centralDirOffset);        // Offset of start of central directory
         buffer.putShort((short) 0);             // Comment length
+        
+        return buffer.array();
+    }
+    
+    /**
+     * Creates a local header for a compression result.
+     *
+     * @param result the compression result to create a local header for
+     * @return the local header as a byte array
+     */
+    private byte[] createLocalHeader(SingleFileCompressionResult result) {
+        byte[] fileNameBytes = result.getEntryName().getBytes(StandardCharsets.UTF_8);
+        
+        // Determine compression method based on whether data was actually compressed
+        short compressionMethod = (result.getCompressedSize() == result.getUncompressedSize()) ? 
+                                  (short) 0 : (short) 8; // 0 = STORE, 8 = DEFLATE
+        
+        ByteBuffer buffer = ByteBuffer.allocate(30 + fileNameBytes.length);
+        buffer.order(ByteOrder.LITTLE_ENDIAN);
+        
+        buffer.putInt(0x04034b50);              // Local file header signature
+        buffer.putShort((short) 20);            // Version needed to extract
+        buffer.putShort((short) 0);             // General purpose bit flag
+        buffer.putShort(compressionMethod);     // Compression method (STORE or DEFLATE)
+        buffer.putInt((int) result.getDosTime()); // Last mod file time & date
+        buffer.putInt((int) result.getCrc32()); // CRC-32
+        
+        // Handle sizes that might exceed 32-bit limits
+        int compressedSize = (int) Math.min(result.getCompressedSize(), 0xFFFFFFFFL);
+        int uncompressedSize = (int) Math.min(result.getUncompressedSize(), 0xFFFFFFFFL);
+        
+        buffer.putInt(compressedSize);          // Compressed size
+        buffer.putInt(uncompressedSize);        // Uncompressed size
+        buffer.putShort((short) fileNameBytes.length); // File name length
+        buffer.putShort((short) 0);             // Extra field length
+        
+        buffer.put(fileNameBytes);              // File name
         
         return buffer.array();
     }

@@ -17,13 +17,13 @@ public class SingleFileCompressionResult extends CompressionResult {
     private final long uncompressedSize;
     private final long compressedSize;
     private final long dosTime;
-    private final long localHeaderOffset;
+    private long localHeaderOffset;
 
     /**
      * Creates a new SingleFileCompressionResult with the specified parameters.
      *
      * @param entryName the name of the entry within the ZIP archive
-     * @param localHeader the local file header for this entry
+     * @param localHeader the local file header for this entry (can be null if ZipAssembler will create it)
      * @param compressedData the compressed file data
      * @param crc32 the CRC32 checksum of the uncompressed file
      * @param uncompressedSize the uncompressed size of the file
@@ -37,7 +37,7 @@ public class SingleFileCompressionResult extends CompressionResult {
                                      long dosTime, long localHeaderOffset, Duration compressionTime) {
         super(uncompressedSize, compressedSize, 1, compressionTime, null, true, 1);
         this.entryName = Objects.requireNonNull(entryName, "entryName cannot be null");
-        this.localHeader = Objects.requireNonNull(localHeader, "localHeader cannot be null");
+        this.localHeader = localHeader; // Allow null - ZipAssembler will create if needed
         this.compressedData = Objects.requireNonNull(compressedData, "compressedData cannot be null");
         this.crc32 = crc32;
         this.uncompressedSize = uncompressedSize;
@@ -103,10 +103,18 @@ public class SingleFileCompressionResult extends CompressionResult {
     }
 
     /**
+     * Sets the offset where this entry's local header will be written.
+     * @param localHeaderOffset the offset where this entry's local header will be written
+     */
+    public void setLocalHeaderOffset(long localHeaderOffset) {
+        this.localHeaderOffset = localHeaderOffset;
+    }
+
+    /**
      * @return the total size of this entry in the ZIP file (local header + compressed data)
      */
     public long getTotalSize() {
-        return localHeader.length + compressedData.length;
+        return (localHeader != null ? localHeader.length : 0) + compressedData.length;
     }
 
     @Override
